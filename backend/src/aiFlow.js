@@ -16,7 +16,7 @@ function buildFallbackAnswer(rows, rowCount) {
 export async function generateSqlPlan({ question, schemaText, ragContext, allowedTables, previousError = "", previousSql = "" }) {
   const allowlistText = allowedTables.map((table) => `- ${table}`).join("\n");
   const retryHint = previousError
-    ? `Previous SQL failed with DB error:\n${previousError}\nFailed SQL:\n${previousSql || "N/A"}\nFix the table/column names using schema exactly.\n\n`
+    ? `Previous SQL failed with DB/validator error:\n${previousError}\nFailed SQL:\n${previousSql || "N/A"}\nFix the table/column names and join logic using schema exactly.\n\n`
     : "";
   const prompt =
     "You generate PostgreSQL SQL for analytics questions.\n" +
@@ -28,6 +28,12 @@ export async function generateSqlPlan({ question, schemaText, ragContext, allowe
     "- For any dynamic value, use placeholders ($1,$2,...) and put raw values in params.\n" +
     "- Use fully-qualified quoted identifiers from schema.\n" +
     "- Never use unquoted identifiers for table/column names.\n" +
+    "- No comments. No markdown.\n" +
+    "- For joins, use only columns that exist in both tables and prefer stable business keys (*NUM, *ID, etc).\n" +
+    "- Do not add unnecessary join predicates that can drop rows unless asked.\n" +
+    "- For totals/aggregates use COALESCE(SUM(column), 0) when appropriate.\n" +
+    "- If prior attempt had NULL-heavy aggregate output, adjust source table/join key and retry.\n" +
+    "- If user says '<name> project', prefer token-level matching using ILIKE (case-insensitive).\n" +
     "- Limit detail rows to 100 unless question requests otherwise.\n\n" +
     retryHint +
     `Allowed tables:\n${allowlistText || "- none"}\n\n` +

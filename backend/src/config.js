@@ -22,6 +22,9 @@ export const config = {
   geminiApiKey: process.env.GEMINI_API_KEY || "",
   geminiSqlModel: process.env.GEMINI_SQL_MODEL || process.env.GEMINI_MODEL || "gemini-2.0-flash",
   geminiAnswerModel: process.env.GEMINI_ANSWER_MODEL || process.env.GEMINI_MODEL || "gemini-2.0-flash",
+  geminiFallbackModels: parseCsv(process.env.GEMINI_FALLBACK_MODELS).map((name) =>
+    String(name || "").trim().replace(/^models\//i, "")
+  ),
   geminiEmbeddingModel: process.env.GEMINI_EMBEDDING_MODEL || "gemini-embedding-001",
   embeddingDimensions: toNumber(process.env.EMBEDDING_DIMENSIONS, 768),
   redisUrl: process.env.REDIS_URL || "",
@@ -31,6 +34,10 @@ export const config = {
   ragTopK: toNumber(process.env.RAG_TOP_K, 8),
   ragMinScore: toNumber(process.env.RAG_MIN_SCORE, 0.75),
   sqlTimeoutMs: toNumber(process.env.SQL_TIMEOUT_MS, 3000),
+  maxSqlAttempts: Math.max(1, toNumber(process.env.MAX_SQL_ATTEMPTS, 3)),
+  heuristicSchemaCacheTtlMs: toNumber(process.env.HEURISTIC_SCHEMA_CACHE_TTL_MS, 5 * 60 * 1000),
+  maxMultiTableLookupTables: Math.max(2, toNumber(process.env.MAX_MULTI_TABLE_LOOKUP_TABLES, 20)),
+  maxRowsPerTableLookup: Math.max(1, toNumber(process.env.MAX_ROWS_PER_TABLE_LOOKUP, 3)),
   sourceFingerprint: process.env.SOURCE_FINGERPRINT || "default",
   enforceAllowlist: toBool(process.env.ENFORCE_TABLE_ALLOWLIST, true),
   allowedTables: parseCsv(process.env.ALLOWED_TABLES).map((name) => name.toLowerCase())

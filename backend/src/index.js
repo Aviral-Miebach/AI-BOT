@@ -20,10 +20,19 @@ import {
 import { estimateGeminiCostUsd, insertQueryLog } from "./queryLogService.js";
 import { normalizeQuestion } from "./utils.js";
 import { hasRedis } from "./redisClient.js";
+import {
+  applyStatusProcessLogic,
+  buildSqlRetryHint,
+  evaluateResultQuality,
+  isRetryableDbError,
+  tryAmbiguousMultiTableLookup,
+  tryEntityLookupWithoutTable,
+  tryExplicitTableLookup,
+  tryStatusStateCountLookup
+} from "./heuristicService.js";
 
 const app = express();
 const port = config.port;
-const RETRYABLE_DB_ERROR_CODES = new Set(["42P01", "42703", "42601", "42883"]);
 
 function recoverAnswerFromRows(payload) {
   const data = payload || {};
@@ -36,6 +45,14 @@ function recoverAnswerFromRows(payload) {
   const healedAnswer =
     rowCount <= 3 ? `Found ${rowCount} row(s): ${sample}` : `Found ${rowCount} row(s). Top rows: ${sample}`;
   return { ...data, answer: healedAnswer };
+}
+
+function pickBetterAttempt(best, candidate) {
+  if (!best) return candidate;
+  if ((candidate?.quality?.score || 0) > (best?.quality?.score || 0)) return candidate;
+  if ((candidate?.quality?.score || 0) < (best?.quality?.score || 0)) return best;
+  if ((candidate?.result?.rowCount || 0) > (best?.result?.rowCount || 0)) return candidate;
+  return best;
 }
 
 function mapErrorToHttp(error) {
@@ -161,66 +178,11 @@ app.post("/ask", async (req, res) => {
 
     let rows = [];
     let sqlParams = [];
+    let heuristicAnswer = "";
 
     const forceStructuredFallback = looksLikeStructuredQuestion(question);
     const usedStructuredPath = intent === "structured_query" || forceStructuredFallback;
     if (usedStructuredPath) {
-      const sqlResult = await generateSqlPlan({
-        question,
-        schemaText,
-        ragContext,
-        allowedTables
-      });
-      geminiCalls += 1;
-      inputTokens += sqlResult.usage.inputTokens;
-      outputTokens += sqlResult.usage.outputTokens;
-
-      sqlText = normalizeSqlTableRefs(sqlResult.sql, tableMap, columnMap);
-      sqlParams = sqlResult.params || [];
-      sqlGenerated = true;
-
-      let validation = validateReadOnlySql(sqlText, sqlParams, allowedTables);
-      if (!validation.ok) {
-        const retrySqlResult = await generateSqlPlan({
-          question,
-          schemaText,
-          ragContext,
-          allowedTables,
-          previousError: `validator_error:${validation.reason}`,
-          previousSql: sqlText
-        });
-        geminiCalls += 1;
-        inputTokens += retrySqlResult.usage.inputTokens;
-        outputTokens += retrySqlResult.usage.outputTokens;
-
-        sqlText = normalizeSqlTableRefs(retrySqlResult.sql, tableMap, columnMap);
-        sqlParams = retrySqlResult.params || [];
-        validation = validateReadOnlySql(sqlText, sqlParams, allowedTables);
-      }
-
-      if (!validation.ok) {
-        await insertQueryLog(pool, {
-          requestId,
-          questionText: question,
-          normalizedQuestion,
-          cacheLayerHit,
-          semanticScore,
-          sqlGenerated,
-          sqlSafe: false,
-          sqlText,
-          geminiCalls,
-          inputTokens,
-          outputTokens,
-          estimatedCostUsd: estimateGeminiCostUsd({ inputTokens, outputTokens }),
-          latencyMs: Date.now() - startedAt,
-          status: "denied",
-          errorText: validation.reason
-        });
-
-        return res.status(403).json({ requestId, answer: "Query not permitted." });
-      }
-
-      sqlSafe = true;
       const runReadOnlyQuery = async (queryText, params) => {
         const client = await pool.connect();
         try {
@@ -237,56 +199,156 @@ app.post("/ask", async (req, res) => {
         }
       };
 
-      try {
-        const result = await runReadOnlyQuery(validation.sql, sqlParams);
-        rows = result.rows;
-        rowCount = result.rowCount;
-      } catch (dbError) {
-        if (!RETRYABLE_DB_ERROR_CODES.has(dbError.code)) {
-          throw dbError;
+      // First, try deterministic heuristics for common intent patterns.
+      const statusStateLookup = await tryStatusStateCountLookup(pool, question);
+      if (statusStateLookup?.result?.rowCount > 0) {
+        sqlText = statusStateLookup.sql;
+        sqlParams = statusStateLookup.params || [];
+        rows = statusStateLookup.result.rows;
+        rowCount = statusStateLookup.result.rowCount;
+        heuristicAnswer = statusStateLookup.answer || "";
+        sqlGenerated = true;
+        sqlSafe = true;
+      }
+
+      if (!heuristicAnswer && rowCount === 0) {
+        const multiTableLookup = await tryAmbiguousMultiTableLookup(pool, question);
+        if (multiTableLookup?.result?.rowCount > 0) {
+          sqlText = multiTableLookup.sql;
+          sqlParams = multiTableLookup.params || [];
+          rows = multiTableLookup.result.rows;
+          rowCount = multiTableLookup.result.rowCount;
+          heuristicAnswer = multiTableLookup.answer || "";
+          sqlGenerated = true;
+          sqlSafe = true;
+        }
+      }
+
+      // LLM SQL generation with multi-attempt quality loop.
+      if (!heuristicAnswer && rowCount === 0) {
+        let bestAttempt = null;
+        let previousHint = "";
+        let lastRetryableDbError = null;
+        let lastValidationReason = "";
+
+        for (let attempt = 1; attempt <= config.maxSqlAttempts; attempt += 1) {
+          const sqlResult = await generateSqlPlan({
+            question,
+            schemaText,
+            ragContext,
+            allowedTables,
+            previousError: previousHint,
+            previousSql: sqlText || ""
+          });
+          geminiCalls += 1;
+          inputTokens += sqlResult.usage.inputTokens;
+          outputTokens += sqlResult.usage.outputTokens;
+
+          const candidateSql = normalizeSqlTableRefs(sqlResult.sql, tableMap, columnMap);
+          const candidateParams = sqlResult.params || [];
+          sqlGenerated = true;
+
+          const validation = validateReadOnlySql(candidateSql, candidateParams, allowedTables);
+          if (!validation.ok) {
+            lastValidationReason = validation.reason || "validation_failed";
+            previousHint = buildSqlRetryHint({
+              generatedSql: candidateSql,
+              dbError: { code: "VALIDATOR", message: validation.reason }
+            });
+            continue;
+          }
+
+          sqlSafe = true;
+          try {
+            const result = await runReadOnlyQuery(validation.sql, candidateParams);
+            const quality = evaluateResultQuality(question, result);
+            bestAttempt = pickBetterAttempt(bestAttempt, {
+              sql: validation.sql,
+              params: candidateParams,
+              result,
+              quality
+            });
+
+            if (quality.status === "good") {
+              break;
+            }
+            previousHint = buildSqlRetryHint({ generatedSql: validation.sql, quality });
+          } catch (dbError) {
+            if (!isRetryableDbError(dbError)) {
+              throw dbError;
+            }
+            lastRetryableDbError = dbError;
+            previousHint = buildSqlRetryHint({ generatedSql: validation.sql, dbError });
+          }
         }
 
-        const retrySqlResult = await generateSqlPlan({
-          question,
-          schemaText,
-          ragContext,
-          allowedTables,
-          previousError: dbError.message,
-          previousSql: validation.sql
-        });
-        geminiCalls += 1;
-        inputTokens += retrySqlResult.usage.inputTokens;
-        outputTokens += retrySqlResult.usage.outputTokens;
-
-        const retrySqlText = normalizeSqlTableRefs(retrySqlResult.sql, tableMap, columnMap);
-        const retrySqlParams = retrySqlResult.params || [];
-        const retryValidation = validateReadOnlySql(retrySqlText, retrySqlParams, allowedTables);
-        if (!retryValidation.ok) {
-          throw new Error(`Retry SQL rejected: ${retryValidation.reason}`);
+        if (!bestAttempt && lastRetryableDbError) {
+          throw lastRetryableDbError;
+        }
+        if (!bestAttempt && lastValidationReason) {
+          return res.status(403).json({ requestId, answer: "Query not permitted." });
         }
 
-        sqlText = retrySqlText;
-        sqlParams = retrySqlParams;
-        const retryResult = await runReadOnlyQuery(retryValidation.sql, retrySqlParams);
-        rows = retryResult.rows;
-        rowCount = retryResult.rowCount;
+        if (bestAttempt) {
+          sqlText = bestAttempt.sql;
+          sqlParams = bestAttempt.params;
+          rows = bestAttempt.result.rows;
+          rowCount = bestAttempt.result.rowCount;
+        }
+      }
+
+      // Fallback heuristics when SQL result is empty.
+      if (!heuristicAnswer && rowCount === 0) {
+        const explicitLookup = await tryExplicitTableLookup(pool, question);
+        if (explicitLookup?.result?.rowCount > 0) {
+          sqlText = explicitLookup.sql;
+          sqlParams = explicitLookup.params || [];
+          rows = explicitLookup.result.rows;
+          rowCount = explicitLookup.result.rowCount;
+          sqlGenerated = true;
+          sqlSafe = true;
+        }
+      }
+
+      if (!heuristicAnswer && rowCount === 0) {
+        const heuristicLookup = await tryEntityLookupWithoutTable(pool, question);
+        if (heuristicLookup?.result?.rowCount > 0) {
+          sqlText = heuristicLookup.sql;
+          sqlParams = heuristicLookup.params || [];
+          rows = heuristicLookup.result.rows;
+          rowCount = heuristicLookup.result.rowCount;
+          sqlGenerated = true;
+          sqlSafe = true;
+        }
+      }
+
+      if (rowCount > 0 && Array.isArray(rows) && rows.length > 0) {
+        const statusLogic = await applyStatusProcessLogic(pool, { sql: sqlText, rows });
+        if (statusLogic?.applied) {
+          rows = statusLogic.rows;
+          rowCount = rows.length;
+        }
       }
     }
 
-    const answerResult = await generateGroundedAnswer({
-      question,
-      sql: sqlText,
-      params: sqlParams,
-      rows,
-      rowCount,
-      ragContext
-    });
-    geminiCalls += 1;
-    inputTokens += answerResult.usage.inputTokens;
-    outputTokens += answerResult.usage.outputTokens;
+    let answerText = heuristicAnswer;
+    if (!answerText) {
+      const answerResult = await generateGroundedAnswer({
+        question,
+        sql: sqlText,
+        params: sqlParams,
+        rows,
+        rowCount,
+        ragContext
+      });
+      geminiCalls += 1;
+      inputTokens += answerResult.usage.inputTokens;
+      outputTokens += answerResult.usage.outputTokens;
+      answerText = answerResult.answer;
+    }
 
     const payload = {
-      answer: answerResult.answer,
+      answer: answerText,
       sql: sqlText,
       rowCount,
       rows
@@ -302,7 +364,7 @@ app.post("/ask", async (req, res) => {
       entities,
       sqlText,
       sqlParams,
-      answerText: answerResult.answer,
+      answerText,
       answerPayload: payload,
       confidence: semanticScore || 0,
       sourceFingerprint: config.sourceFingerprint
