@@ -1,0 +1,11 @@
+node_modules/
+.env
+.env.*
+backend/.env
+backend/src/.env
+frontend/node_modules/
+backend/node_modules/
+frontend/dist/
+backend/out.log
+backend/*.log
+pgvector/
