@@ -179,8 +179,35 @@ function parseExplicitTableLookupQuestion(question) {
       targetColumn: cleanLookupToken(englishStyle[1])
     };
   }
+
+  // Example: "setid for id 951 in ctlbrd01"
+  const directStyle = q.match(
+    /`?([a-zA-Z_][a-zA-Z0-9_]*)`?\s+(?:of|for)\s+`?([a-zA-Z_][a-zA-Z0-9_]*)`?\s+([a-zA-Z0-9_.-]+)\s+(?:in|from)\s+`?([a-zA-Z_][a-zA-Z0-9_]*)`?/i
+  );
+  if (directStyle) {
+    return {
+      tableName: cleanLookupToken(directStyle[4]),
+      filterColumn: cleanLookupToken(directStyle[2]),
+      filterValue: cleanLookupToken(directStyle[3]),
+      targetColumn: cleanLookupToken(directStyle[1])
+    };
+  }
+
+  // Example: "in ctlbrd01 id 951 setid"
+  const compactStyle = q.match(
+    /\b(?:in|from)\s+`?([a-zA-Z_][a-zA-Z0-9_]*)`?\s+`?([a-zA-Z_][a-zA-Z0-9_]*)`?\s+([a-zA-Z0-9_.-]+)\s+`?([a-zA-Z_][a-zA-Z0-9_]*)`?/i
+  );
+  if (compactStyle) {
+    return {
+      tableName: cleanLookupToken(compactStyle[1]),
+      filterColumn: cleanLookupToken(compactStyle[2]),
+      filterValue: cleanLookupToken(compactStyle[3]),
+      targetColumn: cleanLookupToken(compactStyle[4])
+    };
+  }
   return null;
 }
+
 
 function buildGapLikePattern(value) {
   const compact = String(value || "")
@@ -673,6 +700,69 @@ export async function tryEntityLookupWithoutTable(pool, question) {
       // Skip tables that fail in heuristic mode.
     }
   }
+  return null;
+}
+
+export async function tryFastKpiLookup(pool, question) {
+  const q = String(question || "").trim().toLowerCase();
+  if (!q) return null;
+
+  const asksCount = /\b(how\s*many|howmany|count|number\s+of|total)\b/.test(q);
+  const asksHowMuch = /\b(how\s*much|howmuch)\b/.test(q);
+  const mentionsToday = /\b(today|todays|current\s+day)\b/.test(q);
+  const mentionsThisMonth = /\b(this\s+month|current\s+month)\b/.test(q);
+
+  if (
+    asksCount &&
+    /\b(stock\s*transfer|sti|stn)\b/.test(q) &&
+    /\b(receipt|receipts)\b/.test(q)
+  ) {
+    const sql = mentionsThisMonth
+      ? `
+      SELECT COUNT(DISTINCT "STINUM")::bigint AS value
+      FROM public."RPT_IBCTDETL01"
+      WHERE "TRANDATE" >= date_trunc('month', current_date)::date
+        AND "TRANDATE" < (date_trunc('month', current_date) + interval '1 month')::date
+    `
+      : `
+      SELECT COUNT(DISTINCT "STINUM")::bigint AS value
+      FROM public."RPT_IBCTDETL01"
+      WHERE "TRANDATE" = current_date
+    `;
+    const result = await pool.query(sql);
+    const value = Number(result.rows?.[0]?.value || 0);
+    const period = mentionsThisMonth ? "this month" : mentionsToday ? "today" : "today";
+    return {
+      sql: String(sql).trim(),
+      params: [],
+      answer: `There were ${value} stock transfer receipts done ${period}.`,
+      explanation: "Fast KPI lookup: stock transfer receipts",
+      result: { rowCount: result.rowCount, rows: result.rows }
+    };
+  }
+
+  if (
+    (asksCount || asksHowMuch) &&
+    /\b(quantity|qty)\b/.test(q) &&
+    /\b(received|receive)\b/.test(q) &&
+    mentionsToday
+  ) {
+    const sql = `
+      SELECT COALESCE(SUM("RCVDQTY"), 0) AS value
+      FROM public."RPT_IBCTDETL01"
+      WHERE "TRANDATE" = current_date
+    `;
+    const result = await pool.query(sql);
+    const value = Number(result.rows?.[0]?.value || 0);
+    return {
+      sql: String(sql).trim(),
+      params: [],
+      answer: `The quantity received today is ${value}.`,
+      explanation: "Fast KPI lookup: quantity received today",
+      result: { rowCount: result.rowCount, rows: result.rows }
+    };
+  }
+
   return null;
 }
 

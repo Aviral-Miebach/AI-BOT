@@ -13,7 +13,15 @@ function buildFallbackAnswer(rows, rowCount) {
   return `Found ${rowCount} row(s). Top rows: ${sample}`;
 }
 
-export async function generateSqlPlan({ question, schemaText, ragContext, allowedTables, previousError = "", previousSql = "" }) {
+export async function generateSqlPlan({
+  question,
+  schemaText,
+  schemaRulesText = "",
+  ragContext,
+  allowedTables,
+  previousError = "",
+  previousSql = ""
+}) {
   const allowlistText = allowedTables.map((table) => `- ${table}`).join("\n");
   const retryHint = previousError
     ? `Previous SQL failed with DB/validator error:\n${previousError}\nFailed SQL:\n${previousSql || "N/A"}\nFix the table/column names and join logic using schema exactly.\n\n`
@@ -30,6 +38,7 @@ export async function generateSqlPlan({ question, schemaText, ragContext, allowe
     "- Never use unquoted identifiers for table/column names.\n" +
     "- No comments. No markdown.\n" +
     "- For joins, use only columns that exist in both tables and prefer stable business keys (*NUM, *ID, etc).\n" +
+    "- Prefer join paths that follow FOREIGN KEY / PRIMARY KEY relationships when provided.\n" +
     "- Do not add unnecessary join predicates that can drop rows unless asked.\n" +
     "- For totals/aggregates use COALESCE(SUM(column), 0) when appropriate.\n" +
     "- If prior attempt had NULL-heavy aggregate output, adjust source table/join key and retry.\n" +
@@ -38,6 +47,7 @@ export async function generateSqlPlan({ question, schemaText, ragContext, allowe
     retryHint +
     `Allowed tables:\n${allowlistText || "- none"}\n\n` +
     `Schema:\n${schemaText}\n\n` +
+    `Relational rules:\n${schemaRulesText || "none"}\n\n` +
     `Context:\n${ragContext}\n\n` +
     `Question:\n${question}\n`;
 

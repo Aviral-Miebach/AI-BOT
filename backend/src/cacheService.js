@@ -2,8 +2,8 @@ import { config } from "./config.js";
 import { toVectorLiteral } from "./utils.js";
 import { getRedisJson, setRedisJson } from "./redisClient.js";
 
-export function exactCacheKey(questionHash) {
-  return `qa:exact:${questionHash}`;
+export function exactCacheKey(questionHash, sourceFingerprint = config.sourceFingerprint) {
+  return `qa:exact:${sourceFingerprint}:${questionHash}`;
 }
 
 export async function getExactCache(questionHash) {
@@ -28,11 +28,11 @@ export async function findSemanticCache(pool, embedding) {
         sql_params,
         1 - (question_embedding <=> $1::vector) AS score
       FROM question_answer_cache
-      WHERE expires_at > now()
+      WHERE source_fingerprint = $2
       ORDER BY question_embedding <=> $1::vector
       LIMIT 1
     `,
-    [vector]
+    [vector, config.sourceFingerprint]
   );
   return result.rows[0] || null;
 }
@@ -65,11 +65,10 @@ export async function storeSemanticCache({
         answer_text,
         answer_payload,
         confidence,
-        source_fingerprint,
-        expires_at
+        source_fingerprint
       )
       VALUES (
-        $1, $2, $3::vector, $4, $5::jsonb, $6, $7::jsonb, $8, $9::jsonb, $10, $11, now() + make_interval(hours => $12)
+        $1, $2, $3::vector, $4, $5::jsonb, $6, $7::jsonb, $8, $9::jsonb, $10, $11
       )
       ON CONFLICT (question_hash) DO UPDATE
       SET
@@ -82,7 +81,6 @@ export async function storeSemanticCache({
         answer_payload = EXCLUDED.answer_payload,
         confidence = EXCLUDED.confidence,
         source_fingerprint = EXCLUDED.source_fingerprint,
-        expires_at = EXCLUDED.expires_at,
         last_hit_at = now()
     `,
     [
@@ -96,8 +94,7 @@ export async function storeSemanticCache({
       answerText,
       JSON.stringify(answerPayload || {}),
       confidence || 0,
-      sourceFingerprint,
-      config.semanticTtlHours
+      sourceFingerprint
     ]
   );
 }
@@ -113,4 +110,3 @@ export async function markSemanticHit(pool, id) {
     [id]
   );
 }
-

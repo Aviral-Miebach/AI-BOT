@@ -18,13 +18,14 @@ import {
   storeSemanticCache
 } from "./cacheService.js";
 import { estimateGeminiCostUsd, insertQueryLog } from "./queryLogService.js";
-import { normalizeQuestion } from "./utils.js";
+import { getCacheScopeForQuestion, normalizeQuestion } from "./utils.js";
 import { hasRedis } from "./redisClient.js";
 import {
   applyStatusProcessLogic,
   buildSqlRetryHint,
   evaluateResultQuality,
   isRetryableDbError,
+  tryFastKpiLookup,
   tryAmbiguousMultiTableLookup,
   tryEntityLookupWithoutTable,
   tryExplicitTableLookup,
@@ -97,6 +98,7 @@ app.post("/ask", async (req, res) => {
   let inputTokens = 0;
   let outputTokens = 0;
   let normalizedQuestion = "";
+  let cacheScopeKey = "static";
 
   try {
     const { question } = req.body || {};
@@ -105,7 +107,10 @@ app.post("/ask", async (req, res) => {
     }
 
     normalizedQuestion = normalizeQuestion(question);
-    const questionHash = crypto.createHash("sha256").update(normalizedQuestion).digest("hex");
+    const cacheScope = getCacheScopeForQuestion(question, new Date());
+    cacheScopeKey = cacheScope.scopeKey;
+    const scopedQuestion = `${normalizedQuestion}|${cacheScope.scopeKey}`;
+    const questionHash = crypto.createHash("sha256").update(scopedQuestion).digest("hex");
 
     const exactHit = await getExactCache(questionHash);
     if (exactHit) {
@@ -132,40 +137,82 @@ app.post("/ask", async (req, res) => {
       }
     }
 
+    // Fast deterministic KPI path: avoid Gemini/embedding latency for common dashboard questions.
+    const fastKpi = await tryFastKpiLookup(pool, question);
+    if (fastKpi?.result?.rowCount > 0) {
+      const fastRows = fastKpi.result.rows || [];
+      const fastRowCount = Number(fastKpi.result.rowCount || fastRows.length || 0);
+      const payload = {
+        answer: fastKpi.answer || "Done.",
+        sql: fastKpi.sql || null,
+        rowCount: fastRowCount,
+        rows: fastRows
+      };
+
+      await setExactCache(questionHash, payload);
+
+      await insertQueryLog(pool, {
+        requestId,
+        questionText: question,
+        normalizedQuestion,
+        cacheLayerHit,
+        sqlGenerated: true,
+        sqlSafe: true,
+        sqlText: fastKpi.sql || null,
+        rowCount: fastRowCount,
+        geminiCalls,
+        inputTokens,
+        outputTokens,
+        estimatedCostUsd: estimateGeminiCostUsd({ inputTokens, outputTokens }),
+        latencyMs: Date.now() - startedAt,
+        status: "success",
+        metadata: { fastPath: "kpi_lookup", cacheScopeKey }
+      });
+
+      return res.json({
+        requestId,
+        ...payload,
+        latencyMs: Date.now() - startedAt,
+        cache: cacheLayerHit
+      });
+    }
+
     const embedding = await geminiEmbedText(normalizedQuestion);
     geminiCalls += 1;
 
-    const semantic = await findSemanticCache(pool, embedding);
     const { intent, entities } = detectIntentAndEntities(question);
-    if (semantic) {
-      semanticScore = Number(semantic.score || 0);
-      const reusable =
-        semanticScore >= config.semanticThreshold &&
-        semantic.intent === intent &&
-        isEntityCompatible(entities, semantic.entities);
+    if (!cacheScope.isTemporal) {
+      const semantic = await findSemanticCache(pool, embedding);
+      if (semantic) {
+        semanticScore = Number(semantic.score || 0);
+        const reusable =
+          semanticScore >= config.semanticThreshold &&
+          semantic.intent === intent &&
+          isEntityCompatible(entities, semantic.entities);
 
-      if (reusable) {
-        cacheLayerHit = "semantic";
-        await markSemanticHit(pool, semantic.id);
-        const payload = semantic.answer_payload || { answer: semantic.answer_text || "" };
-        const healed = recoverAnswerFromRows(payload);
-        await setExactCache(questionHash, healed);
+        if (reusable) {
+          cacheLayerHit = "semantic";
+          await markSemanticHit(pool, semantic.id);
+          const payload = semantic.answer_payload || { answer: semantic.answer_text || "" };
+          const healed = recoverAnswerFromRows(payload);
+          await setExactCache(questionHash, healed);
 
-        await insertQueryLog(pool, {
-          requestId,
-          questionText: question,
-          normalizedQuestion,
-          cacheLayerHit,
-          semanticScore,
-          latencyMs: Date.now() - startedAt,
-          status: "success"
-        });
+          await insertQueryLog(pool, {
+            requestId,
+            questionText: question,
+            normalizedQuestion,
+            cacheLayerHit,
+            semanticScore,
+            latencyMs: Date.now() - startedAt,
+            status: "success"
+          });
 
-        return res.json({ requestId, ...healed, reused: "semantic_cache", semanticScore });
+          return res.json({ requestId, ...healed, reused: "semantic_cache", semanticScore });
+        }
       }
     }
 
-    const { text: schemaText, tables: schemaTables, tableMap, columnMap } = await loadSchemaInfo(pool);
+    const { text: schemaText, rulesText: schemaRulesText, tables: schemaTables, tableMap, columnMap } = await loadSchemaInfo(pool);
     const allowAllTables = config.allowedTables.includes("*");
     const allowedTables = config.enforceAllowlist
       ? allowAllTables
@@ -211,6 +258,19 @@ app.post("/ask", async (req, res) => {
         sqlSafe = true;
       }
 
+      // Explicit table lookups should run before ambiguous and LLM paths.
+      if (!heuristicAnswer && rowCount === 0) {
+        const explicitLookup = await tryExplicitTableLookup(pool, question);
+        if (explicitLookup?.result?.rowCount > 0) {
+          sqlText = explicitLookup.sql;
+          sqlParams = explicitLookup.params || [];
+          rows = explicitLookup.result.rows;
+          rowCount = explicitLookup.result.rowCount;
+          sqlGenerated = true;
+          sqlSafe = true;
+        }
+      }
+
       if (!heuristicAnswer && rowCount === 0) {
         const multiTableLookup = await tryAmbiguousMultiTableLookup(pool, question);
         if (multiTableLookup?.result?.rowCount > 0) {
@@ -235,6 +295,7 @@ app.post("/ask", async (req, res) => {
           const sqlResult = await generateSqlPlan({
             question,
             schemaText,
+            schemaRulesText,
             ragContext,
             allowedTables,
             previousError: previousHint,
@@ -299,18 +360,6 @@ app.post("/ask", async (req, res) => {
 
       // Fallback heuristics when SQL result is empty.
       if (!heuristicAnswer && rowCount === 0) {
-        const explicitLookup = await tryExplicitTableLookup(pool, question);
-        if (explicitLookup?.result?.rowCount > 0) {
-          sqlText = explicitLookup.sql;
-          sqlParams = explicitLookup.params || [];
-          rows = explicitLookup.result.rows;
-          rowCount = explicitLookup.result.rowCount;
-          sqlGenerated = true;
-          sqlSafe = true;
-        }
-      }
-
-      if (!heuristicAnswer && rowCount === 0) {
         const heuristicLookup = await tryEntityLookupWithoutTable(pool, question);
         if (heuristicLookup?.result?.rowCount > 0) {
           sqlText = heuristicLookup.sql;
@@ -355,20 +404,22 @@ app.post("/ask", async (req, res) => {
     };
 
     await setExactCache(questionHash, payload);
-    await storeSemanticCache({
-      pool,
-      normalizedQuestion,
-      questionHash,
-      embedding,
-      intent,
-      entities,
-      sqlText,
-      sqlParams,
-      answerText,
-      answerPayload: payload,
-      confidence: semanticScore || 0,
-      sourceFingerprint: config.sourceFingerprint
-    });
+    if (!cacheScope.isTemporal) {
+      await storeSemanticCache({
+        pool,
+        normalizedQuestion,
+        questionHash,
+        embedding,
+        intent,
+        entities,
+        sqlText,
+        sqlParams,
+        answerText,
+        answerPayload: payload,
+        confidence: semanticScore || 0,
+        sourceFingerprint: config.sourceFingerprint
+      });
+    }
 
     await insertQueryLog(pool, {
       requestId,
@@ -386,7 +437,7 @@ app.post("/ask", async (req, res) => {
       estimatedCostUsd: estimateGeminiCostUsd({ inputTokens, outputTokens }),
       latencyMs: Date.now() - startedAt,
       status: "success",
-      metadata: { intent, entities, usedStructuredPath, forceStructuredFallback }
+      metadata: { intent, entities, usedStructuredPath, forceStructuredFallback, cacheScopeKey }
     });
 
     return res.json({

@@ -38,6 +38,10 @@ export async function getRedisJson(key) {
 export async function setRedisJson(key, value, ttlSeconds) {
   const c = await getRedisClient();
   if (!c) return;
-  await c.setEx(key, ttlSeconds, JSON.stringify(value));
+  const ttl = Number(ttlSeconds || 0);
+  if (!Number.isFinite(ttl) || ttl <= 0) {
+    await c.set(key, JSON.stringify(value));
+    return;
+  }
+  await c.setEx(key, ttl, JSON.stringify(value));
 }
-

@@ -6,7 +6,15 @@ const geminiApiKey = String(config.geminiApiKey || "")
   .trim()
   .replace(/^['"]|['"]$/g, "");
 const genAI = geminiApiKey ? new GoogleGenerativeAI(geminiApiKey) : null;
-const staticFallbackModels = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash"];
+const staticFallbackModels = [
+  "gemini-2.5-flash",
+  "gemini-2.5-pro",
+  "gemini-2.0-flash",
+  "gemini-2.0-flash-lite",
+  "gemini-flash-latest",
+  "gemini-flash-lite-latest",
+  "gemini-pro-latest"
+];
 let resolvedModelName = null;
 
 function normalizeModelName(name) {
@@ -44,7 +52,7 @@ function wrapGeminiError(error, model, stage) {
 }
 
 async function discoverModelName() {
-  const fallbackModel = normalizeModelName(config.geminiSqlModel || "gemini-1.5-flash");
+  const fallbackModel = normalizeModelName(config.geminiSqlModel || "gemini-2.5-flash");
   if (!geminiApiKey) {
     throw new Error("Missing GEMINI_API_KEY in environment");
   }
@@ -151,9 +159,39 @@ export async function geminiGenerateJson({ model, prompt }) {
   });
 
   const text = response?.response?.text?.() || "{}";
-  const json = parseJsonObject(text);
   const usage = parseGeminiUsage(response);
-  return { json, usage, rawText: text };
+
+  try {
+    const json = parseJsonObject(text);
+    return { json, usage, rawText: text };
+  } catch (_parseError) {
+    // Repair pass: force conversion to strict JSON if model emitted noisy text.
+    const repairPrompt =
+      "Convert the following model output into strict valid JSON.\n" +
+      "Return only JSON, no markdown, no commentary.\n\n" +
+      `OUTPUT_TO_REPAIR:\n${text}`;
+
+    const repairedResponse = await generateContentWithFallback({
+      stage: "json_repair",
+      model,
+      contents: [{ role: "user", parts: [{ text: repairPrompt }] }],
+      generationConfig: { temperature: 0, responseMimeType: "application/json" }
+    });
+
+    const repairedText = repairedResponse?.response?.text?.() || "{}";
+    const repairedJson = parseJsonObject(repairedText);
+    const repairedUsage = parseGeminiUsage(repairedResponse);
+
+    return {
+      json: repairedJson,
+      usage: {
+        inputTokens: usage.inputTokens + repairedUsage.inputTokens,
+        outputTokens: usage.outputTokens + repairedUsage.outputTokens
+      },
+      rawText: text,
+      repairedRawText: repairedText
+    };
+  }
 }
 
 export async function geminiEmbedText(text) {

@@ -1,6 +1,12 @@
-CREATE EXTENSION IF NOT EXISTS vector;
+-- Use this for DB: reports-ai, schema: public
+-- Safe re-run script (CREATE IF NOT EXISTS)
 
-CREATE TABLE IF NOT EXISTS documents (
+BEGIN;
+
+CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public;
+SET search_path TO public;
+
+CREATE TABLE IF NOT EXISTS public.documents (
   id BIGSERIAL PRIMARY KEY,
   source_type TEXT NOT NULL,
   source_id TEXT NOT NULL,
@@ -12,13 +18,13 @@ CREATE TABLE IF NOT EXISTS documents (
   is_active BOOLEAN NOT NULL DEFAULT TRUE
 );
 
-CREATE INDEX IF NOT EXISTS idx_documents_source ON documents(source_type, source_id);
-CREATE INDEX IF NOT EXISTS idx_documents_active ON documents(is_active);
-CREATE INDEX IF NOT EXISTS idx_documents_metadata_gin ON documents USING GIN (metadata);
+CREATE INDEX IF NOT EXISTS idx_documents_source ON public.documents(source_type, source_id);
+CREATE INDEX IF NOT EXISTS idx_documents_active ON public.documents(is_active);
+CREATE INDEX IF NOT EXISTS idx_documents_metadata_gin ON public.documents USING GIN (metadata);
 CREATE INDEX IF NOT EXISTS idx_documents_embedding_ivfflat
-ON documents USING ivfflat (embedding vector_cosine_ops) WITH (lists = 200);
+  ON public.documents USING ivfflat (embedding vector_cosine_ops) WITH (lists = 200);
 
-CREATE TABLE IF NOT EXISTS question_answer_cache (
+CREATE TABLE IF NOT EXISTS public.question_answer_cache (
   id BIGSERIAL PRIMARY KEY,
   normalized_question TEXT NOT NULL,
   question_hash CHAR(64) NOT NULL,
@@ -33,20 +39,18 @@ CREATE TABLE IF NOT EXISTS question_answer_cache (
   source_fingerprint TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   last_hit_at TIMESTAMPTZ,
-  hit_count BIGINT NOT NULL DEFAULT 0,
-  expires_at TIMESTAMPTZ NOT NULL
+  hit_count BIGINT NOT NULL DEFAULT 0
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS uq_qa_cache_hash ON question_answer_cache(question_hash);
-CREATE INDEX IF NOT EXISTS idx_qa_cache_expires ON question_answer_cache(expires_at);
-CREATE INDEX IF NOT EXISTS idx_qa_cache_entities_gin ON question_answer_cache USING GIN (entities);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_qa_cache_hash ON public.question_answer_cache(question_hash);
+CREATE INDEX IF NOT EXISTS idx_qa_cache_entities_gin ON public.question_answer_cache USING GIN (entities);
 CREATE INDEX IF NOT EXISTS idx_qa_cache_embedding_ivfflat
-ON question_answer_cache USING ivfflat (question_embedding vector_cosine_ops) WITH (lists = 200);
+  ON public.question_answer_cache USING ivfflat (question_embedding vector_cosine_ops) WITH (lists = 200);
 
-CREATE TABLE IF NOT EXISTS feedback (
+CREATE TABLE IF NOT EXISTS public.feedback (
   id BIGSERIAL PRIMARY KEY,
   request_id UUID NOT NULL,
-  cache_id BIGINT REFERENCES question_answer_cache(id),
+  cache_id BIGINT REFERENCES public.question_answer_cache(id),
   rating SMALLINT NOT NULL CHECK (rating BETWEEN 1 AND 5),
   is_correct BOOLEAN,
   user_comment TEXT,
@@ -55,10 +59,10 @@ CREATE TABLE IF NOT EXISTS feedback (
   metadata JSONB NOT NULL DEFAULT '{}'::jsonb
 );
 
-CREATE INDEX IF NOT EXISTS idx_feedback_request ON feedback(request_id);
-CREATE INDEX IF NOT EXISTS idx_feedback_created_at ON feedback(created_at);
+CREATE INDEX IF NOT EXISTS idx_feedback_request ON public.feedback(request_id);
+CREATE INDEX IF NOT EXISTS idx_feedback_created_at ON public.feedback(created_at);
 
-CREATE TABLE IF NOT EXISTS query_logs (
+CREATE TABLE IF NOT EXISTS public.query_logs (
   id BIGSERIAL PRIMARY KEY,
   request_id UUID NOT NULL UNIQUE,
   user_id TEXT,
@@ -82,6 +86,19 @@ CREATE TABLE IF NOT EXISTS query_logs (
   metadata JSONB NOT NULL DEFAULT '{}'::jsonb
 );
 
-CREATE INDEX IF NOT EXISTS idx_query_logs_created_at ON query_logs(created_at);
-CREATE INDEX IF NOT EXISTS idx_query_logs_cache_layer ON query_logs(cache_layer_hit);
-CREATE INDEX IF NOT EXISTS idx_query_logs_status ON query_logs(status);
+CREATE INDEX IF NOT EXISTS idx_query_logs_created_at ON public.query_logs(created_at);
+CREATE INDEX IF NOT EXISTS idx_query_logs_cache_layer ON public.query_logs(cache_layer_hit);
+CREATE INDEX IF NOT EXISTS idx_query_logs_status ON public.query_logs(status);
+
+COMMIT;
+
+-- Verify
+SELECT extname, extversion, extnamespace::regnamespace::text AS extension_schema
+FROM pg_extension
+WHERE extname = 'vector';
+
+SELECT
+  to_regclass('public.documents') AS documents,
+  to_regclass('public.question_answer_cache') AS question_answer_cache,
+  to_regclass('public.feedback') AS feedback,
+  to_regclass('public.query_logs') AS query_logs;
