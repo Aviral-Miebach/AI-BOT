@@ -766,6 +766,44 @@ export async function tryFastKpiLookup(pool, question) {
   return null;
 }
 
+export async function tryWarehouseLocationLookup(pool, question) {
+  const q = String(question || "").trim();
+  if (!q) return null;
+
+  const match = q.match(/\bwhere\s+is\s+(.+?)\s+warehouse\s+located\b/i);
+  if (!match) return null;
+  const warehouse = cleanLookupToken(match[1]);
+  if (!warehouse || warehouse.length < 2 || warehouse.length > 64) return null;
+
+  const sql = `
+    SELECT "WHSENAME", "WHSEADDR1", "WHSEADDR2", "WHSEADDR3", "CITY", "STATE", "PINCD", "COUNTRY"
+    FROM public."WHSEMST00"
+    WHERE "WHSENAME" ILIKE $1
+    LIMIT 100
+  `;
+  const params = [`%${warehouse}%`];
+  const result = await pool.query(sql, params);
+  if (result.rowCount <= 0) return null;
+
+  const row = result.rows[0] || {};
+  const parts = [row.WHSEADDR1, row.WHSEADDR2, row.WHSEADDR3, row.CITY, row.STATE, row.COUNTRY].filter(
+    (v) => !isNullLike(v)
+  );
+  const label = row.WHSENAME || warehouse;
+  const answer =
+    parts.length > 0
+      ? `${label} warehouse is located at ${parts.join(", ")}.`
+      : `${label} warehouse location is available in WHSEMST00.`;
+
+  return {
+    sql: String(sql).trim(),
+    params,
+    answer,
+    explanation: "Fast warehouse location lookup",
+    result: { rowCount: result.rowCount, rows: result.rows }
+  };
+}
+
 async function deriveStatusThresholdsFromTable(pool, { schema, table, statusColumn }) {
   const tableRef = `${quoteIdentifier(schema)}.${quoteIdentifier(table)}`;
   const statusRef = quoteIdentifier(statusColumn);

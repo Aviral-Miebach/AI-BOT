@@ -15,11 +15,14 @@ export default function App() {
     setResult(null);
 
     try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 90000);
       const response = await fetch("/ask", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question })
-      });
+        body: JSON.stringify({ question }),
+        signal: controller.signal
+      }).finally(() => clearTimeout(timeout));
 
       const data = await response.json();
       if (!response.ok) {
@@ -30,7 +33,11 @@ export default function App() {
 
       setResult(data);
     } catch (err) {
-      setError(err.message);
+      if (err?.name === "AbortError") {
+        setError("Request timed out. Please try again.");
+      } else {
+        setError(err.message);
+      }
     } finally {
       setLoading(false);
     }

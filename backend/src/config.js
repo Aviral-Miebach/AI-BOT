@@ -75,6 +75,8 @@ export const config = {
   ragTopK: toNumber(process.env.RAG_TOP_K, 8),
   ragMinScore: toNumber(process.env.RAG_MIN_SCORE, 0.75),
   sqlTimeoutMs: toNumber(process.env.SQL_TIMEOUT_MS, 3000),
+  geminiRequestTimeoutMs: Math.max(5000, toNumber(process.env.GEMINI_REQUEST_TIMEOUT_MS, 25000)),
+  answerMaxWaitMs: Math.max(500, toNumber(process.env.ANSWER_MAX_WAIT_MS, 3000)),
   maxSqlAttempts: Math.max(1, toNumber(process.env.MAX_SQL_ATTEMPTS, 3)),
   heuristicSchemaCacheTtlMs: toNumber(process.env.HEURISTIC_SCHEMA_CACHE_TTL_MS, 5 * 60 * 1000),
   schemaRulesMaxLines: Math.max(50, toNumber(process.env.SCHEMA_RULES_MAX_LINES, 400)),

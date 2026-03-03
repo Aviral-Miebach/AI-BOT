@@ -26,6 +26,7 @@ import {
   evaluateResultQuality,
   isRetryableDbError,
   tryFastKpiLookup,
+  tryWarehouseLocationLookup,
   tryAmbiguousMultiTableLookup,
   tryEntityLookupWithoutTable,
   tryExplicitTableLookup,
@@ -34,6 +35,13 @@ import {
 
 const app = express();
 const port = config.port;
+
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms))
+  ]);
+}
 
 function recoverAnswerFromRows(payload) {
   const data = payload || {};
@@ -167,6 +175,46 @@ app.post("/ask", async (req, res) => {
         latencyMs: Date.now() - startedAt,
         status: "success",
         metadata: { fastPath: "kpi_lookup", cacheScopeKey }
+      });
+
+      return res.json({
+        requestId,
+        ...payload,
+        latencyMs: Date.now() - startedAt,
+        cache: cacheLayerHit
+      });
+    }
+
+    // Fast deterministic warehouse location path.
+    const fastWarehouse = await tryWarehouseLocationLookup(pool, question);
+    if (fastWarehouse?.result?.rowCount > 0) {
+      const fastRows = fastWarehouse.result.rows || [];
+      const fastRowCount = Number(fastWarehouse.result.rowCount || fastRows.length || 0);
+      const payload = {
+        answer: fastWarehouse.answer || "Done.",
+        sql: fastWarehouse.sql || null,
+        rowCount: fastRowCount,
+        rows: fastRows
+      };
+
+      await setExactCache(questionHash, payload);
+
+      await insertQueryLog(pool, {
+        requestId,
+        questionText: question,
+        normalizedQuestion,
+        cacheLayerHit,
+        sqlGenerated: true,
+        sqlSafe: true,
+        sqlText: fastWarehouse.sql || null,
+        rowCount: fastRowCount,
+        geminiCalls,
+        inputTokens,
+        outputTokens,
+        estimatedCostUsd: estimateGeminiCostUsd({ inputTokens, outputTokens }),
+        latencyMs: Date.now() - startedAt,
+        status: "success",
+        metadata: { fastPath: "warehouse_lookup", cacheScopeKey }
       });
 
       return res.json({
@@ -382,18 +430,27 @@ app.post("/ask", async (req, res) => {
 
     let answerText = heuristicAnswer;
     if (!answerText) {
-      const answerResult = await generateGroundedAnswer({
-        question,
-        sql: sqlText,
-        params: sqlParams,
-        rows,
-        rowCount,
-        ragContext
-      });
-      geminiCalls += 1;
-      inputTokens += answerResult.usage.inputTokens;
-      outputTokens += answerResult.usage.outputTokens;
-      answerText = answerResult.answer;
+      try {
+        const answerResult = await withTimeout(
+          generateGroundedAnswer({
+            question,
+            sql: sqlText,
+            params: sqlParams,
+            rows,
+            rowCount,
+            ragContext
+          }),
+          config.answerMaxWaitMs,
+          "Answer generation"
+        );
+        geminiCalls += 1;
+        inputTokens += answerResult.usage.inputTokens;
+        outputTokens += answerResult.usage.outputTokens;
+        answerText = answerResult.answer;
+      } catch {
+        // Return immediately with deterministic fallback instead of holding frontend in loading state.
+        answerText = recoverAnswerFromRows({ rows, rowCount }).answer;
+      }
     }
 
     const payload = {

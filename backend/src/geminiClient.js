@@ -17,6 +17,15 @@ const staticFallbackModels = [
 ];
 let resolvedModelName = null;
 
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
+    )
+  ]);
+}
+
 function normalizeModelName(name) {
   return String(name || "")
     .trim()
@@ -122,7 +131,11 @@ async function generateContentWithFallback({ stage, model, contents, generationC
   for (const modelName of candidates) {
     const genModel = genAI.getGenerativeModel({ model: modelName });
     try {
-      const completion = await genModel.generateContent({ contents, generationConfig });
+      const completion = await withTimeout(
+        genModel.generateContent({ contents, generationConfig }),
+        config.geminiRequestTimeoutMs,
+        `Gemini ${stage}`
+      );
       resolvedModelName = modelName;
       return completion;
     } catch (error) {
@@ -133,7 +146,11 @@ async function generateContentWithFallback({ stage, model, contents, generationC
         try {
           const relaxedConfig = { ...generationConfig };
           delete relaxedConfig.responseMimeType;
-          const completion = await genModel.generateContent({ contents, generationConfig: relaxedConfig });
+          const completion = await withTimeout(
+            genModel.generateContent({ contents, generationConfig: relaxedConfig }),
+            config.geminiRequestTimeoutMs,
+            `Gemini ${stage}`
+          );
           resolvedModelName = modelName;
           return completion;
         } catch (retryError) {
@@ -204,14 +221,17 @@ export async function geminiEmbedText(text) {
     outputDimensionality: config.embeddingDimensions
   };
 
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), config.geminiRequestTimeoutMs);
   const res = await fetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       "x-goog-api-key": geminiApiKey
     },
-    body: JSON.stringify(payload)
-  });
+    body: JSON.stringify(payload),
+    signal: controller.signal
+  }).finally(() => clearTimeout(timeout));
 
   if (!res.ok) {
     const errBody = await res.text();
