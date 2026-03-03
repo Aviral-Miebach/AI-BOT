@@ -1,5 +1,5 @@
-@import url("https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Sora:wght@600;700&display=swap%22"); 
-:root { 
+@import url("https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Sora:wght@600;700&display=swap%22%22");
+:root {
   --page-bg-a: #c8d6d8;
   --page-bg-b: #d8e2e4;
   --hero-text: #132b3d;
@@ -291,16 +291,25 @@ h1 {
 }
  
 .avatar {
-  width: 54px;
-  height: 54px;
-  border-radius: 50%;
-  display: grid;
-  place-items: center;
+  width: 108px;
+  height: 56px;
+  border-radius: 50px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   flex-shrink: 0;
-  color: #f2ffff;
-  font-size: 2rem;
-  font-weight: 800;
-  background: linear-gradient(155deg, #2da4a6, #1d7f94);
+  background: transparent;
+  border: none;
+  overflow: hidden;
+}
+ 
+.avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  object-position: center;
+  transform: none;
+  display: block;
 }
  
 .title-text h2 {
@@ -366,6 +375,70 @@ h1 {
   margin: 0;
   white-space: pre-line;
   word-break: break-word;
+}
+ 
+.data-card {
+  margin-top: 12px;
+  border-top: 1px solid #a9c4c8;
+  padding-top: 10px;
+}
+ 
+.data-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+  color: #335367;
+  font-size: 0.94rem;
+  font-weight: 600;
+}
+ 
+.csv-btn {
+  border: 1px solid #7caab3;
+  background: #e6f2f3;
+  color: #1e6272;
+  border-radius: 999px;
+  padding: 6px 12px;
+  font-size: 0.85rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+ 
+.csv-btn:hover {
+  background: #d9ecee;
+}
+ 
+.data-table-wrap {
+  border: 1px solid #a6c4c8;
+  border-radius: 12px;
+  overflow: auto;
+  max-height: 280px;
+  background: #e5eff1;
+}
+ 
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  min-width: 520px;
+  font-size: 0.88rem;
+}
+ 
+.data-table th,
+.data-table td {
+  padding: 8px 10px;
+  text-align: left;
+  border-bottom: 1px solid #c2d7da;
+  white-space: nowrap;
+}
+ 
+.data-table th {
+  position: sticky;
+  top: 0;
+  background: #cfe3e6;
+  color: #224559;
+  font-weight: 700;
+  z-index: 1;
 }
  
 .message.assistant {
@@ -629,3 +702,5 @@ h1 {
     padding: 0 18px;
   }
 }
+ 
+ 

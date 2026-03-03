@@ -10,6 +10,8 @@ import { detectIntentAndEntities, isEntityCompatible, looksLikeStructuredQuestio
 import { validateReadOnlySql } from "./sqlSafety.js";
 import { normalizeSqlTableRefs } from "./sqlNormalize.js";
 import { formatRagContext, retrieveRagChunks } from "./ragService.js";
+import { computeScopedAllowlist } from "./tableRoutingService.js";
+import { getWmsTrainingSuggestedTables } from "./wmsTrainingContextService.js";
 import {
   findSemanticCache,
   getExactCache,
@@ -18,7 +20,12 @@ import {
   storeSemanticCache
 } from "./cacheService.js";
 import { estimateGeminiCostUsd, insertQueryLog } from "./queryLogService.js";
-import { getCacheScopeForQuestion, normalizeQuestion } from "./utils.js";
+import {
+  ensureQuestionSqlRegistry,
+  findQuestionSqlRegistryMatch,
+  markQuestionSqlRegistryHit
+} from "./queryRegistryService.js";
+import { getCacheScopeForQuestion, normalizeQuestion, parseQuestionDateContext } from "./utils.js";
 import { hasRedis } from "./redisClient.js";
 import {
   applyStatusProcessLogic,
@@ -64,6 +71,56 @@ function pickBetterAttempt(best, candidate) {
   return best;
 }
 
+function applyDateContextToSql(sql, params, dateContext) {
+  let text = String(sql || "").trim();
+  let values = Array.isArray(params) ? [...params] : [];
+  if (!text || !dateContext) return { sql: text, params: values };
+
+  if (dateContext.mode === "day" && dateContext.valueDate) {
+    const dateValue = String(dateContext.valueDate);
+    const hasPlaceholder = /\$\d+\b/.test(text);
+    if (!hasPlaceholder) {
+      if (/\bcurrent_date\b/i.test(text)) {
+        text = text.replace(/\bcurrent_date\b/gi, () => "$1::date");
+        values = [dateValue];
+        return { sql: text, params: values };
+      }
+      if (/'20\d{2}-\d{2}-\d{2}'/.test(text)) {
+        text = text.replace(/'20\d{2}-\d{2}-\d{2}'/g, () => "$1::date");
+        values = [dateValue];
+        return { sql: text, params: values };
+      }
+      return { sql: text, params: values };
+    }
+    if (values.length === 0 && /\$1\b/.test(text)) {
+      values = [dateValue];
+    }
+    return { sql: text, params: values };
+  }
+
+  if (dateContext.mode === "month" && dateContext.startDate && dateContext.endDateExclusive) {
+    const start = String(dateContext.startDate);
+    const end = String(dateContext.endDateExclusive);
+    const hasPlaceholder = /\$\d+\b/.test(text);
+    if (!hasPlaceholder) {
+      const before = text;
+      text = text
+        .replace(/date_trunc\('month',\s*current_date\)::date/gi, () => "$1::date")
+        .replace(/\(date_trunc\('month',\s*current_date\)\s*\+\s*interval\s*'1 month'\)::date/gi, () => "$2::date");
+      if (text !== before) {
+        values = [start, end];
+        return { sql: text, params: values };
+      }
+      return { sql: text, params: values };
+    }
+    if (values.length === 0 && /\$1\b/.test(text) && /\$2\b/.test(text)) {
+      values = [start, end];
+    }
+  }
+
+  return { sql: text, params: values };
+}
+
 function mapErrorToHttp(error) {
   const msg = String(error?.message || "");
   if (msg.includes("Too Many Requests") || msg.includes("[429")) {
@@ -107,6 +164,7 @@ app.post("/ask", async (req, res) => {
   let outputTokens = 0;
   let normalizedQuestion = "";
   let cacheScopeKey = "static";
+  let dateContext = null;
 
   try {
     const { question } = req.body || {};
@@ -114,11 +172,102 @@ app.post("/ask", async (req, res) => {
       return res.status(400).json({ error: "Question is required." });
     }
 
+    const runReadOnlyQuery = async (queryText, params = []) => {
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN READ ONLY");
+        await client.query(`SET LOCAL statement_timeout = '${config.sqlTimeoutMs}ms'`);
+        const result = await client.query(queryText, params);
+        await client.query("COMMIT");
+        return result;
+      } catch (dbError) {
+        await client.query("ROLLBACK");
+        throw dbError;
+      } finally {
+        client.release();
+      }
+    };
+
+    dateContext = parseQuestionDateContext(question, new Date());
     normalizedQuestion = normalizeQuestion(question);
     const cacheScope = getCacheScopeForQuestion(question, new Date());
     cacheScopeKey = cacheScope.scopeKey;
     const scopedQuestion = `${normalizedQuestion}|${cacheScope.scopeKey}`;
     const questionHash = crypto.createHash("sha256").update(scopedQuestion).digest("hex");
+
+    await ensureQuestionSqlRegistry(pool).catch(() => {});
+    const registryMatch = await findQuestionSqlRegistryMatch(pool, normalizedQuestion).catch(() => null);
+    if (registryMatch?.sql_text) {
+      try {
+        const registrySql = String(registryMatch.sql_text || "").trim();
+        const registryAllowlist = Array.isArray(registryMatch.source_tables)
+          ? [
+              ...new Set(
+                registryMatch.source_tables
+                  .map((t) => String(t || "").replace(/"/g, "").toLowerCase().trim())
+                  .filter(Boolean)
+                  .flatMap((t) => {
+                    if (t.includes(".")) {
+                      return [t, t.split(".").pop()];
+                    }
+                    return [t, `public.${t}`];
+                  })
+              )
+            ]
+          : [];
+        const { tableMap: registryTableMap, columnMap: registryColumnMap } = await loadSchemaInfo(pool);
+        const normalizedRegistrySql = normalizeSqlTableRefs(registrySql, registryTableMap, registryColumnMap);
+        const dateAdjustedRegistry = applyDateContextToSql(normalizedRegistrySql, [], dateContext);
+        const registryValidation = validateReadOnlySql(dateAdjustedRegistry.sql, dateAdjustedRegistry.params, registryAllowlist, {
+          allowStringLiterals: true
+        });
+        if (registryValidation.ok) {
+          const registryResult = await runReadOnlyQuery(registryValidation.sql, dateAdjustedRegistry.params);
+          const payload = recoverAnswerFromRows({
+            answer:
+              registryResult.rowCount > 0
+                ? `Data fetched from ${registryAllowlist.join(", ")}.`
+                : "No matching records were found.",
+            sql: registryValidation.sql,
+            rowCount: registryResult.rowCount,
+            rows: registryResult.rows
+          });
+          await markQuestionSqlRegistryHit(pool, registryMatch.id).catch(() => {});
+          await setExactCache(questionHash, payload);
+          await insertQueryLog(pool, {
+            requestId,
+            questionText: question,
+            normalizedQuestion,
+            cacheLayerHit: "registry",
+            sqlGenerated: true,
+            sqlSafe: true,
+            sqlText: registryValidation.sql,
+            rowCount: registryResult.rowCount,
+            geminiCalls,
+            inputTokens,
+            outputTokens,
+            estimatedCostUsd: estimateGeminiCostUsd({ inputTokens, outputTokens }),
+            latencyMs: Date.now() - startedAt,
+            status: "success",
+            metadata: {
+              fastPath: "question_sql_registry",
+              sourceTables: registryAllowlist,
+              cacheScopeKey,
+              sqlParams: dateAdjustedRegistry.params,
+              dateContext
+            }
+          });
+          return res.json({
+            requestId,
+            ...payload,
+            latencyMs: Date.now() - startedAt,
+            cache: "registry"
+          });
+        }
+      } catch {
+        // Fallback to standard pipeline when registry SQL is stale or invalid.
+      }
+    }
 
     const exactHit = await getExactCache(questionHash);
     if (exactHit) {
@@ -262,11 +411,36 @@ app.post("/ask", async (req, res) => {
 
     const { text: schemaText, rulesText: schemaRulesText, tables: schemaTables, tableMap, columnMap } = await loadSchemaInfo(pool);
     const allowAllTables = config.allowedTables.includes("*");
-    const allowedTables = config.enforceAllowlist
+    const baseAllowedTables = config.enforceAllowlist
       ? allowAllTables
         ? schemaTables
         : config.allowedTables
       : schemaTables;
+    const trainingSuggestedTables = getWmsTrainingSuggestedTables({
+      question,
+      schemaTables,
+      baseAllowedTables,
+      maxTables: config.wmsTrainingContextRoutingMaxTables
+    });
+    let scopedAllowedTables = computeScopedAllowlist({
+      question,
+      schemaTables,
+      baseAllowedTables,
+      preferredTables: trainingSuggestedTables
+    });
+    if (Array.isArray(registryMatch?.source_tables) && registryMatch.source_tables.length > 0) {
+      const schemaSet = new Set(schemaTables.map((table) => String(table || "").toLowerCase()));
+      const forcedRegistryTables = [
+        ...new Set(
+          registryMatch.source_tables
+            .map((table) => String(table || "").replace(/"/g, "").toLowerCase().trim())
+            .filter((table) => schemaSet.has(table))
+        )
+      ];
+      if (forcedRegistryTables.length > 0) {
+        scopedAllowedTables = forcedRegistryTables;
+      }
+    }
 
     const ragChunks = await retrieveRagChunks(pool, embedding).catch(() => []);
     const ragContext = formatRagContext(ragChunks);
@@ -278,22 +452,6 @@ app.post("/ask", async (req, res) => {
     const forceStructuredFallback = looksLikeStructuredQuestion(question);
     const usedStructuredPath = intent === "structured_query" || forceStructuredFallback;
     if (usedStructuredPath) {
-      const runReadOnlyQuery = async (queryText, params) => {
-        const client = await pool.connect();
-        try {
-          await client.query("BEGIN READ ONLY");
-          await client.query(`SET LOCAL statement_timeout = '${config.sqlTimeoutMs}ms'`);
-          const result = await client.query(queryText, params);
-          await client.query("COMMIT");
-          return result;
-        } catch (dbError) {
-          await client.query("ROLLBACK");
-          throw dbError;
-        } finally {
-          client.release();
-        }
-      };
-
       // First, try deterministic heuristics for common intent patterns.
       const statusStateLookup = await tryStatusStateCountLookup(pool, question);
       if (statusStateLookup?.result?.rowCount > 0) {
@@ -345,7 +503,8 @@ app.post("/ask", async (req, res) => {
             schemaText,
             schemaRulesText,
             ragContext,
-            allowedTables,
+            allowedTables: scopedAllowedTables,
+            dateContext,
             previousError: previousHint,
             previousSql: sqlText || ""
           });
@@ -353,11 +512,14 @@ app.post("/ask", async (req, res) => {
           inputTokens += sqlResult.usage.inputTokens;
           outputTokens += sqlResult.usage.outputTokens;
 
-          const candidateSql = normalizeSqlTableRefs(sqlResult.sql, tableMap, columnMap);
-          const candidateParams = sqlResult.params || [];
+          let candidateSql = normalizeSqlTableRefs(sqlResult.sql, tableMap, columnMap);
+          let candidateParams = sqlResult.params || [];
+          const dateAdjustedCandidate = applyDateContextToSql(candidateSql, candidateParams, dateContext);
+          candidateSql = dateAdjustedCandidate.sql;
+          candidateParams = dateAdjustedCandidate.params;
           sqlGenerated = true;
 
-          const validation = validateReadOnlySql(candidateSql, candidateParams, allowedTables);
+          const validation = validateReadOnlySql(candidateSql, candidateParams, scopedAllowedTables);
           if (!validation.ok) {
             lastValidationReason = validation.reason || "validation_failed";
             previousHint = buildSqlRetryHint({
@@ -494,7 +656,17 @@ app.post("/ask", async (req, res) => {
       estimatedCostUsd: estimateGeminiCostUsd({ inputTokens, outputTokens }),
       latencyMs: Date.now() - startedAt,
       status: "success",
-      metadata: { intent, entities, usedStructuredPath, forceStructuredFallback, cacheScopeKey }
+      metadata: {
+        intent,
+        entities,
+        dateContext,
+        usedStructuredPath,
+        forceStructuredFallback,
+        cacheScopeKey,
+        trainingSuggestedTables,
+        allowlistScopedCount: scopedAllowedTables.length,
+        allowlistBaseCount: baseAllowedTables.length
+      }
     });
 
     return res.json({

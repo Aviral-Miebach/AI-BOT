@@ -16,11 +16,14 @@ function normalizeTableName(raw) {
 }
 
 function extractTableNames(sql) {
+  const nonTableTokens = new Set(["current_date", "current_time", "current_timestamp", "now"]);
   const matches = [];
   const regex = /\b(?:from|join)\s+((?:"[^"]+"|\w+)(?:\.(?:"[^"]+"|\w+))?)/gi;
   let m;
   while ((m = regex.exec(sql))) {
-    matches.push(normalizeTableName(m[1]));
+    const normalized = normalizeTableName(m[1]);
+    if (!normalized || nonTableTokens.has(normalized)) continue;
+    matches.push(normalized);
   }
   return [...new Set(matches)];
 }
@@ -35,9 +38,10 @@ function checkStatementTypes(ast) {
   return true;
 }
 
-function validatePlaceholders(sql, params) {
+function validatePlaceholders(sql, params, options = {}) {
+  const allowStringLiterals = Boolean(options.allowStringLiterals);
   const all = [...sql.matchAll(/\$(\d+)/g)].map((m) => Number(m[1]));
-  if (all.length === 0 && /'[^']*'/.test(sql)) {
+  if (all.length === 0 && /'[^']*'/.test(sql) && !allowStringLiterals) {
     return { ok: false, reason: "string_literals_not_allowed_use_placeholders" };
   }
   if (all.length === 0) return { ok: true };
@@ -60,13 +64,13 @@ function fallbackSelectShapeCheck(sql) {
   return { ok: true };
 }
 
-export function validateReadOnlySql(sql, params, allowedTables) {
+export function validateReadOnlySql(sql, params, allowedTables, options = {}) {
   const cleaned = sanitizeSql(sql);
   if (!cleaned) return { ok: false, reason: "empty_sql" };
   if (COMMENT_PATTERN.test(cleaned)) return { ok: false, reason: "comments_not_allowed" };
   if (FORBIDDEN_PATTERN.test(cleaned)) return { ok: false, reason: "forbidden_keyword" };
 
-  const placeholderCheck = validatePlaceholders(cleaned, params);
+  const placeholderCheck = validatePlaceholders(cleaned, params, options);
   if (!placeholderCheck.ok) return placeholderCheck;
 
   const allowlist = new Set((allowedTables || []).map((t) => String(t).toLowerCase()));

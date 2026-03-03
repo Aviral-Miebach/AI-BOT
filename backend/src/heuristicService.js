@@ -1,4 +1,5 @@
 import { config } from "./config.js";
+import { parseQuestionDateContext } from "./utils.js";
 
 const RETRYABLE_DB_ERROR_CODES = new Set(["42P01", "42703", "42601", "42883", "42P10", "42804"]);
 const LOOKUP_TEXT_COLUMN_RE = /(title|name|country|state|city|code|desc|description|type|category|label|key|value)/i;
@@ -707,35 +708,70 @@ export async function tryFastKpiLookup(pool, question) {
   const q = String(question || "").trim().toLowerCase();
   if (!q) return null;
 
+  const dateContext = parseQuestionDateContext(question, new Date());
   const asksCount = /\b(how\s*many|howmany|count|number\s+of|total)\b/.test(q);
   const asksHowMuch = /\b(how\s*much|howmuch)\b/.test(q);
   const mentionsToday = /\b(today|todays|current\s+day)\b/.test(q);
   const mentionsThisMonth = /\b(this\s+month|current\s+month)\b/.test(q);
+  const dateFilter =
+    dateContext?.mode === "day" && dateContext.valueDate
+      ? {
+          clause: `"TRANDATE" = $1::date`,
+          params: [dateContext.valueDate],
+          periodLabel: `on ${dateContext.valueDate}`
+        }
+      : dateContext?.mode === "month" && dateContext.startDate && dateContext.endDateExclusive
+        ? {
+            clause: `"TRANDATE" >= $1::date AND "TRANDATE" < $2::date`,
+            params: [dateContext.startDate, dateContext.endDateExclusive],
+            periodLabel: `for ${dateContext.startDate.slice(0, 7)}`
+          }
+        : mentionsThisMonth
+          ? {
+              clause: `"TRANDATE" >= date_trunc('month', current_date)::date
+        AND "TRANDATE" < (date_trunc('month', current_date) + interval '1 month')::date`,
+              params: [],
+              periodLabel: "this month"
+            }
+          : {
+              clause: `"TRANDATE" = current_date`,
+              params: [],
+              periodLabel: mentionsToday ? "today" : "today"
+            };
+
+  if (/\btruck\b/.test(q) && /\bturnaround\b/.test(q)) {
+    const sql = `
+      SELECT COALESCE(SUM("TIMETAKENINSEC") / NULLIF(SUM("NUMOFDOC"), 0), 0) AS value
+      FROM public."RPT_GOCTDETL01"
+      WHERE ${dateFilter.clause}
+    `;
+    const result = await pool.query(sql, dateFilter.params);
+    const value = Number(result.rows?.[0]?.value || 0);
+    return {
+      sql: String(sql).trim(),
+      params: dateFilter.params,
+      answer: `Truck turnaround time ${dateFilter.periodLabel} is ${value.toFixed(2)} seconds.`,
+      explanation: "Fast KPI lookup: truck turnaround time",
+      result: { rowCount: result.rowCount, rows: result.rows }
+    };
+  }
 
   if (
     asksCount &&
     /\b(stock\s*transfer|sti|stn)\b/.test(q) &&
     /\b(receipt|receipts)\b/.test(q)
   ) {
-    const sql = mentionsThisMonth
-      ? `
+    const sql = `
       SELECT COUNT(DISTINCT "STINUM")::bigint AS value
       FROM public."RPT_IBCTDETL01"
-      WHERE "TRANDATE" >= date_trunc('month', current_date)::date
-        AND "TRANDATE" < (date_trunc('month', current_date) + interval '1 month')::date
-    `
-      : `
-      SELECT COUNT(DISTINCT "STINUM")::bigint AS value
-      FROM public."RPT_IBCTDETL01"
-      WHERE "TRANDATE" = current_date
+      WHERE ${dateFilter.clause}
     `;
-    const result = await pool.query(sql);
+    const result = await pool.query(sql, dateFilter.params);
     const value = Number(result.rows?.[0]?.value || 0);
-    const period = mentionsThisMonth ? "this month" : mentionsToday ? "today" : "today";
     return {
       sql: String(sql).trim(),
-      params: [],
-      answer: `There were ${value} stock transfer receipts done ${period}.`,
+      params: dateFilter.params,
+      answer: `There were ${value} stock transfer receipts done ${dateFilter.periodLabel}.`,
       explanation: "Fast KPI lookup: stock transfer receipts",
       result: { rowCount: result.rowCount, rows: result.rows }
     };
@@ -745,20 +781,20 @@ export async function tryFastKpiLookup(pool, question) {
     (asksCount || asksHowMuch) &&
     /\b(quantity|qty)\b/.test(q) &&
     /\b(received|receive)\b/.test(q) &&
-    mentionsToday
+    (mentionsToday || mentionsThisMonth || Boolean(dateContext?.mode))
   ) {
     const sql = `
       SELECT COALESCE(SUM("RCVDQTY"), 0) AS value
       FROM public."RPT_IBCTDETL01"
-      WHERE "TRANDATE" = current_date
+      WHERE ${dateFilter.clause}
     `;
-    const result = await pool.query(sql);
+    const result = await pool.query(sql, dateFilter.params);
     const value = Number(result.rows?.[0]?.value || 0);
     return {
       sql: String(sql).trim(),
-      params: [],
-      answer: `The quantity received today is ${value}.`,
-      explanation: "Fast KPI lookup: quantity received today",
+      params: dateFilter.params,
+      answer: `The quantity received ${dateFilter.periodLabel} is ${value}.`,
+      explanation: "Fast KPI lookup: quantity received",
       result: { rowCount: result.rowCount, rows: result.rows }
     };
   }

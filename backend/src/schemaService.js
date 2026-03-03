@@ -1,4 +1,5 @@
 import { config } from "./config.js";
+import { buildManualJoinRules } from "./manualJoinRules.js";
 
 const CACHE_TTL_MS = 60_000;
 let schemaCache = { text: "", rulesText: "", tables: [], tableMap: new Map(), columnMap: new Map(), expiresAt: 0 };
@@ -125,7 +126,9 @@ export async function loadSchemaInfo(pool) {
   }
 
   const maxRuleLines = Math.max(1, Number(config.schemaRulesMaxLines || 400));
-  const rulesText = rules.slice(0, maxRuleLines).join("\n");
+  const manualRules = buildManualJoinRules(tables);
+  const mergedRules = [...manualRules, ...rules];
+  const rulesText = mergedRules.slice(0, maxRuleLines).join("\n");
 
   schemaCache = {
     text: lines.join("\n"),

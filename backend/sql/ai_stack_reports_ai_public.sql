@@ -90,6 +90,23 @@ CREATE INDEX IF NOT EXISTS idx_query_logs_created_at ON public.query_logs(create
 CREATE INDEX IF NOT EXISTS idx_query_logs_cache_layer ON public.query_logs(cache_layer_hit);
 CREATE INDEX IF NOT EXISTS idx_query_logs_status ON public.query_logs(status);
 
+CREATE TABLE IF NOT EXISTS public.question_sql_registry (
+  id BIGSERIAL PRIMARY KEY,
+  source_name TEXT NOT NULL DEFAULT 'delete_js',
+  question_text TEXT NOT NULL,
+  normalized_question TEXT NOT NULL UNIQUE,
+  sql_text TEXT NOT NULL,
+  source_tables TEXT[] NOT NULL DEFAULT '{}'::text[],
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  hit_count BIGINT NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_hit_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_question_sql_registry_active
+  ON public.question_sql_registry(is_active, normalized_question);
+
 COMMIT;
 
 -- Verify
@@ -101,4 +118,5 @@ SELECT
   to_regclass('public.documents') AS documents,
   to_regclass('public.question_answer_cache') AS question_answer_cache,
   to_regclass('public.feedback') AS feedback,
-  to_regclass('public.query_logs') AS query_logs;
+  to_regclass('public.query_logs') AS query_logs,
+  to_regclass('public.question_sql_registry') AS question_sql_registry;

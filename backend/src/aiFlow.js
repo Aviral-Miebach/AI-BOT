@@ -1,5 +1,7 @@
 import { config } from "./config.js";
 import { geminiGenerateJson } from "./geminiClient.js";
+import { getDeleteJsPromptSeed } from "./deleteJsSeedService.js";
+import { getWmsTrainingPromptSeed } from "./wmsTrainingContextService.js";
 
 function buildFallbackAnswer(rows, rowCount) {
   if (!Array.isArray(rows) || rowCount <= 0) {
@@ -19,13 +21,24 @@ export async function generateSqlPlan({
   schemaRulesText = "",
   ragContext,
   allowedTables,
+  dateContext = null,
   previousError = "",
   previousSql = ""
 }) {
   const allowlistText = allowedTables.map((table) => `- ${table}`).join("\n");
+  const deleteJsSeed = getDeleteJsPromptSeed();
+  const wmsTrainingSeed = getWmsTrainingPromptSeed({ question, allowedTables });
   const retryHint = previousError
     ? `Previous SQL failed with DB/validator error:\n${previousError}\nFailed SQL:\n${previousSql || "N/A"}\nFix the table/column names and join logic using schema exactly.\n\n`
     : "";
+  const dateHint =
+    dateContext?.mode === "day" && dateContext.valueDate
+      ? `Resolved date from question: ${dateContext.valueDate}.\n` +
+        "The SQL MUST filter with this date and use placeholders (example: DATE(column) = $1::date) and params must include this date string.\n\n"
+      : dateContext?.mode === "month" && dateContext.startDate && dateContext.endDateExclusive
+        ? `Resolved month range from question: [${dateContext.startDate}, ${dateContext.endDateExclusive}).\n` +
+          "The SQL MUST filter date using placeholders (example: DATE(column) >= $1::date AND DATE(column) < $2::date) and params must include both bounds.\n\n"
+        : "";
   const prompt =
     "You generate PostgreSQL SQL for analytics questions.\n" +
     "Return strict JSON only: {\"sql\":\"...\",\"params\":[...]}\n" +
@@ -37,17 +50,23 @@ export async function generateSqlPlan({
     "- Use fully-qualified quoted identifiers from schema.\n" +
     "- Never use unquoted identifiers for table/column names.\n" +
     "- No comments. No markdown.\n" +
+    "- Use explicit JOIN ... ON syntax only. Never use comma-separated FROM joins.\n" +
+    "- If MANUAL_PREFERRED_JOIN rules are present in relational rules, prefer those join paths over guessed joins.\n" +
     "- For joins, use only columns that exist in both tables and prefer stable business keys (*NUM, *ID, etc).\n" +
     "- Prefer join paths that follow FOREIGN KEY / PRIMARY KEY relationships when provided.\n" +
+    "- Avoid joining many detail tables unless the question requires all of them.\n" +
     "- Do not add unnecessary join predicates that can drop rows unless asked.\n" +
     "- For totals/aggregates use COALESCE(SUM(column), 0) when appropriate.\n" +
     "- If prior attempt had NULL-heavy aggregate output, adjust source table/join key and retry.\n" +
     "- If user says '<name> project', prefer token-level matching using ILIKE (case-insensitive).\n" +
     "- Limit detail rows to 100 unless question requests otherwise.\n\n" +
     retryHint +
+    dateHint +
     `Allowed tables:\n${allowlistText || "- none"}\n\n` +
     `Schema:\n${schemaText}\n\n` +
     `Relational rules:\n${schemaRulesText || "none"}\n\n` +
+    `${deleteJsSeed ? `Legacy prompt seeds (from delete.js):\n${deleteJsSeed}\n\n` : ""}` +
+    `${wmsTrainingSeed ? `${wmsTrainingSeed}\n\n` : ""}` +
     `Context:\n${ragContext}\n\n` +
     `Question:\n${question}\n`;
 
